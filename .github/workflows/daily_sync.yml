@@ -1,6 +1,8 @@
 name: Daily financial news sync
 
 on:
+  push:
+    branches: [main]
   schedule:
     # 06:00 UTC every day. GitHub may start the job a few minutes later.
     - cron: "0 6 * * *"
