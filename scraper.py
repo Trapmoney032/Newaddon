@@ -1,7 +1,7 @@
-"""Daily ingestion of buyer-relevant Bulgarian property news into Supabase.
+"""Daily ingestion of Bulgarian home sale and rent price news into Supabase.
 
-Stories are kept only when they are useful to someone buying, financing, or
-running a home: the housing market, mortgage rates, and the costs of owning.
+A headline is kept only when it is about the price of homes for sale or rent
+in Bulgaria. Company profiles, commercial property, and foreign stories are left out.
 """
 
 from __future__ import annotations
@@ -95,12 +95,12 @@ FEEDS: tuple[Feed, ...] = (
     Feed(
         source_name="Investor.bg",
         url="https://www.investor.bg/rss/c/534-novini",
-        default_category="real_estate",
+        default_category=None,
     ),
     Feed(
         source_name="Investor.bg",
         url="https://www.investor.bg/rss/c/109-imoti",
-        default_category="real_estate",
+        default_category=None,
     ),
     Feed(
         source_name="Investor.bg",
@@ -178,22 +178,82 @@ def published_at(entry: Any) -> str | None:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
-def category_for(title: str, default_category: str | None) -> str | None:
+PLACES = (
+    "софия",
+    "пловдив",
+    "варна",
+    "бургас",
+    "русе",
+    "стара загора",
+    "плевен",
+    "българи",
+    "у нас",
+    "в страната",
+)
+HOMES = ("апартамент", "жилищ", "къщ", "двустаен", "тристаен", "наем", "имот")
+PRICE_WORDS = ("цен", "поскъп", "поевтин", "наем", "продажб", "сделк")
+BLOCKED_SOURCES = ("imot.bg", "imoti.net", "imoti", "airbnb")
+FOREIGN = (
+    "европ",
+    "сащ",
+    "щати",
+    "великобритания",
+    "англия",
+    "германия",
+    "франция",
+    "испания",
+    "гърция",
+    "италия",
+    "полша",
+    "румъния",
+    "еврозон",
+)
+NOISE = ("всс", "кандидат", "бейби", "старческ", "строителен бизнес")
+
+
+def has_word(text: str, stem: str, endings: tuple[str, ...]) -> bool:
+    start = 0
+    while True:
+        index = text.find(stem, start)
+        if index < 0:
+            return False
+        if index == 0 or not text[index - 1].isalpha():
+            rest = text[index + len(stem) :]
+            for ending in endings:
+                if not rest.startswith(ending):
+                    continue
+                after = rest[len(ending) :]
+                if not after or not after[0].isalpha():
+                    return True
+        start = index + 1
+
+
+def is_home_price_story(title: str) -> bool:
+    """True only for a Bulgarian sale or rent price headline."""
     folded = title.casefold()
-    for category, keywords in TOPIC_KEYWORDS:
-        if category == "real_estate":
-            continue
-        if any(keyword in folded for keyword in keywords):
-            return category
-    if any(keyword in folded for keyword in HOME_COST_CONTEXT_KEYWORDS) and any(
-        word in folded for word in HOME_COST_CONTEXT
-    ):
-        return "home_costs"
-    if "лихв" in folded and any(word in folded for word in ("кредит", "вноск", "жилищ", "ипотек")):
-        return "mortgages"
-    if any(keyword in folded for keyword in TOPIC_KEYWORDS[-1][1]):
+    if any(marker in folded for marker in BLOCKED_SOURCES):
+        return False
+    if any(marker in folded for marker in NOISE):
+        return False
+    if has_word(folded, "мол", ("", "а", "ът", "ове", "овете")):
+        return False
+    if has_word(folded, "офис", ("", "а", "ът", "и", "ите")):
+        return False
+    if any(word in folded for word in ("индустриал", "логистич", "ритейл", "хотел", "склад", "бизнес имот")):
+        return False
+    if any(marker in folded for marker in FOREIGN) and not any(place in folded for place in PLACES):
+        return False
+    return (
+        any(place in folded for place in PLACES)
+        and any(word in folded for word in HOMES)
+        and any(word in folded for word in PRICE_WORDS)
+    )
+
+
+def category_for(title: str, default_category: str | None) -> str | None:
+    if is_home_price_story(title):
         return "real_estate"
-    return default_category
+    return None
 
 
 def normalize_entry(feed: Feed, entry: Any) -> dict[str, str] | None:

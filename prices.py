@@ -1,12 +1,15 @@
-"""Sync the official quarterly house price index for Bulgaria's six largest cities."""
+"""Sync the official house price index for Bulgaria's six largest cities, 2015 onward."""
 
 from __future__ import annotations
 
 import logging
 import re
 import sys
+import zipfile
 from collections import Counter
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
+from xml.etree import ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,7 +18,7 @@ from supabase import Client, create_client
 from config import load_settings
 
 TABLE_NAME = "city_price_snapshots"
-SOURCE_URL = "https://www.nsi.bg/index.php/statistical-data/98/328"
+SOURCE_URL = "https://www.nsi.bg/sites/default/files/files/data/timeseries/HPI_2.4.xlsx"
 SOURCE_NAME = "NSI"
 REQUEST_TIMEOUT_SECONDS = 40
 USER_AGENT = "BezAgenciaNewsSync/1.0 (+https://github.com/Trapmoney032/Newaddon)"
@@ -163,6 +166,111 @@ def count_by_city(client: Client) -> dict[str, int]:
     return dict(Counter(row["city"] for row in result.data))
 
 
+NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+QUARTER_MARKS = {"I": 1, "II": 2, "III": 3, "IV": 4}
+
+
+def column_index(cell_ref: str) -> int:
+    letters = "".join(char for char in cell_ref if char.isalpha())
+    number = 0
+    for char in letters:
+        number = number * 26 + ord(char.upper()) - 64
+    return number - 1
+
+
+def sheet_rows(content: bytes) -> list[dict[int, str]]:
+    workbook = zipfile.ZipFile(BytesIO(content))
+    shared: list[str] = []
+    root = ET.fromstring(workbook.read("xl/sharedStrings.xml"))
+    for item in root.findall("m:si", NS):
+        shared.append("".join(node.text or "" for node in item.iter(f"{{{NS['m']}}}t")))
+    sheet = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+    rows: list[dict[int, str]] = []
+    for row in sheet.findall("m:sheetData/m:row", NS):
+        values: dict[int, str] = {}
+        for cell in row.findall("m:c", NS):
+            raw = cell.find("m:v", NS)
+            if raw is None or raw.text is None:
+                continue
+            if cell.attrib.get("t") == "s":
+                values[column_index(cell.attrib.get("r", "A1"))] = shared[int(raw.text)]
+            else:
+                values[column_index(cell.attrib.get("r", "A1"))] = raw.text
+        rows.append(values)
+    return rows
+
+
+def quarter_number(label: str) -> int | None:
+    match = re.search(r"(IV|III|II|I)", label.replace("І", "I").replace("І", "I"))
+    if match is None:
+        return None
+    return QUARTER_MARKS[match.group(1)]
+
+
+def parse_workbook(content: bytes) -> list[dict[str, object]]:
+    rows = sheet_rows(content)
+    if len(rows) < 6:
+        raise RuntimeError("NSI workbook is missing the price table")
+    year_row, quarter_row = rows[3], rows[4]
+    columns: list[tuple[int, int, int]] = []
+    current_year: int | None = None
+    last_column = max([0, *year_row.keys(), *quarter_row.keys()])
+    for index in range(3, last_column + 1):
+        year_match = re.search(r"20\d{2}", year_row.get(index, ""))
+        if year_match:
+            current_year = int(year_match.group(0))
+        quarter = quarter_number(quarter_row.get(index, ""))
+        if current_year is not None and quarter is not None:
+            columns.append((index, current_year, quarter))
+    if not columns:
+        raise RuntimeError("NSI workbook did not include years and quarters")
+
+    snapshots: list[dict[str, object]] = []
+    current_city: str | None = None
+    for row in rows[5:]:
+        label = re.sub(r"\s*\d+$", "", clean(row.get(0, ""))).strip()
+        code = clean(row.get(1, ""))
+        if label:
+            current_city = CITY_NAMES.get(label)
+        if current_city is None or code != "H.1.":
+            continue
+        for index, year, quarter in columns:
+            raw_value = row.get(index, "").strip()
+            if raw_value in {"", "/", "-", "..."}:
+                continue
+            try:
+                index_value = Decimal(raw_value.replace(",", "."))
+            except InvalidOperation:
+                continue
+            snapshots.append(
+                {
+                    "city": current_city,
+                    "market": MARKET,
+                    "property_type": PROPERTY_TYPE,
+                    "dwelling_status": "total",
+                    "period_year": year,
+                    "period_quarter": quarter,
+                    "index_value": str(index_value),
+                    "base_year": BASE_YEAR,
+                    "source_name": SOURCE_NAME,
+                    "source_url": SOURCE_URL,
+                }
+            )
+    if not snapshots:
+        raise RuntimeError("NSI workbook was fetched but no city index values were parsed")
+    return snapshots
+
+
+def fetch_workbook() -> bytes:
+    response = requests.get(
+        SOURCE_URL,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    )
+    response.raise_for_status()
+    return response.content
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -170,7 +278,7 @@ def main() -> int:
     )
     try:
         settings = load_settings()
-        snapshots = parse_snapshots(fetch_page())
+        snapshots = parse_workbook(fetch_workbook())
     except Exception:
         logger.exception("City price index could not be parsed")
         return 1
